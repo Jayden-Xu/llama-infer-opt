@@ -61,6 +61,7 @@ set -euo pipefail
 # ----- cases: "<label> <env-var-list>" ----------------------------------
 CASES=(
     "baseline                "                       # nothing enabled
+    "vit-cache                OPT_VIT_CACHE=1"       # per-image ViT embedding cache
 )
 
 # ----- config ----------------------------------------------------------

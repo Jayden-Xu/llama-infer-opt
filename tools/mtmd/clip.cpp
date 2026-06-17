@@ -13,9 +13,11 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <list>
 #include <map>
 #include <stdexcept>
 #include <unordered_set>
@@ -173,6 +175,21 @@ struct clip_ctx {
 
     bool support_batch = false;
 
+    // ABB-OPT (opt/vit-cache): per-image ViT embedding cache.
+    // Gated by OPT_VIT_CACHE=1; when off, no allocations and no lookup happen.
+    struct embd_cache_entry {
+        uint64_t key      = 0;
+        int      nx       = 0;
+        int      ny       = 0;
+        size_t   n_tokens = 0;   // embd.size() == n_tokens * n_embd_out
+        std::vector<float> embd;
+    };
+    bool   embd_cache_enabled  = false;
+    size_t embd_cache_capacity = 8;
+    std::list<embd_cache_entry> embd_cache;
+    size_t embd_cache_hits   = 0;
+    size_t embd_cache_misses = 0;
+
     clip_ctx(clip_context_params & ctx_params) {
         flash_attn_type = ctx_params.flash_attn_type;
         no_alloc = ctx_params.no_alloc;
@@ -222,6 +239,20 @@ struct clip_ctx {
         }
 
         debug_output_embeddings = std::getenv("MTMD_DEBUG_EMBEDDINGS") != nullptr;
+
+        // ABB-OPT (opt/vit-cache): enable per-image ViT embedding cache when
+        // OPT_VIT_CACHE is set to a non-zero value. OPT_VIT_CACHE_SIZE=N
+        // controls capacity (default 8 images); the cache uses LRU eviction.
+        if (const char * v = std::getenv("OPT_VIT_CACHE")) {
+            embd_cache_enabled = (v[0] && v[0] != '0');
+        }
+        if (const char * v = std::getenv("OPT_VIT_CACHE_SIZE")) {
+            int n = atoi(v);
+            if (n > 0) embd_cache_capacity = (size_t) n;
+        }
+        if (embd_cache_enabled) {
+            LOG_INF("%s: ViT embedding cache enabled (capacity = %zu)\n", __func__, embd_cache_capacity);
+        }
     }
 
     ~clip_ctx() {
@@ -3509,6 +3540,40 @@ bool clip_image_encode(struct clip_ctx * ctx, const int n_threads, clip_image_f3
     return clip_image_batch_encode(ctx, n_threads, &imgs, out_vec);
 }
 
+// ABB-OPT (opt/vit-cache): shared static counter so that forward-path dumps
+// and cache-hit-path dumps don't collide on the same MTMD_DUMP_EMBD prefix.
+static int g_mtmd_dump_idx = 0;
+
+// ABB-OPT (opt/vit-cache): FNV-1a 64-bit over (nx, ny, raw f32 pixel buffer).
+// Used as the lookup key for the per-image ViT embedding cache. Audio inputs
+// and placeholder entries are skipped by the caller; we only see real f32 RGB
+// patches here. The pixel buffer is already normalized so the same source
+// image always hashes to the same value.
+static uint64_t clip_image_f32_fnv1a(const clip_image_f32 & img) {
+    constexpr uint64_t FNV_OFFSET = 0xcbf29ce484222325ULL;
+    constexpr uint64_t FNV_PRIME  = 0x00000100000001B3ULL;
+
+    uint64_t h = FNV_OFFSET;
+    auto mix_bytes = [&](const uint8_t * p, size_t n) {
+        for (size_t i = 0; i < n; i++) {
+            h ^= (uint64_t) p[i];
+            h *= FNV_PRIME;
+        }
+    };
+
+    int nx = img.nx();
+    int ny = img.ny();
+    mix_bytes(reinterpret_cast<const uint8_t *>(&nx), sizeof(nx));
+    mix_bytes(reinterpret_cast<const uint8_t *>(&ny), sizeof(ny));
+
+    const auto & buf = img.get_ro_buf();
+    if (!buf.empty()) {
+        mix_bytes(reinterpret_cast<const uint8_t *>(buf.data()),
+                  buf.size() * sizeof(float));
+    }
+    return h;
+}
+
 bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_image_f32_batch * imgs_c_ptr, std::vector<float> & out_batch_embd) {
     const clip_image_f32_batch & imgs = *imgs_c_ptr;
     int n_batch_cur = imgs.entries.size();
@@ -3522,6 +3587,95 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
     // if buffers are not allocated, we need to do a warmup run to allocate them
     if (!ctx->is_allocated) {
         clip_model_loader::warmup(*ctx, *imgs_c_ptr);
+    }
+
+    // ABB-OPT (opt/vit-cache): try to satisfy the request from the per-image
+    // embedding cache. We only do this for vision (audio paths are out-of-scope)
+    // and only when *all* entries hit the cache; partial hits would still need
+    // a graph build for the misses, and the bookkeeping isn't worth it for the
+    // workloads we target (multi-turn chat with the same one or few images).
+    std::vector<uint64_t> entry_keys;
+    if (ctx->embd_cache_enabled && !imgs.is_audio && !imgs.entries.empty()) {
+        entry_keys.resize(imgs.entries.size());
+        bool all_hit = true;
+        size_t total_floats = 0;
+        for (size_t i = 0; i < imgs.entries.size(); i++) {
+            const auto & img = *imgs.entries[i];
+            entry_keys[i] = clip_image_f32_fnv1a(img);
+
+            const auto & cache = ctx->embd_cache;
+            auto it = std::find_if(cache.begin(), cache.end(),
+                [&](const clip_ctx::embd_cache_entry & e) {
+                    return e.key == entry_keys[i] && e.nx == img.nx() && e.ny == img.ny();
+                });
+            if (it == cache.end()) {
+                all_hit = false;
+                break;
+            }
+            total_floats += it->embd.size();
+        }
+
+        if (all_hit) {
+            out_batch_embd.resize(total_floats);
+            size_t off = 0;
+            for (size_t i = 0; i < imgs.entries.size(); i++) {
+                const auto & img = *imgs.entries[i];
+                auto & cache = ctx->embd_cache;
+                auto it = std::find_if(cache.begin(), cache.end(),
+                    [&](const clip_ctx::embd_cache_entry & e) {
+                        return e.key == entry_keys[i] && e.nx == img.nx() && e.ny == img.ny();
+                    });
+                std::memcpy(out_batch_embd.data() + off,
+                            it->embd.data(),
+                            it->embd.size() * sizeof(float));
+                off += it->embd.size();
+                // bump LRU: move hit to the front
+                if (it != cache.begin()) {
+                    cache.splice(cache.begin(), cache, it);
+                }
+            }
+            ctx->embd_cache_hits += imgs.entries.size();
+            size_t cache_bytes = 0;
+            for (const auto & e : ctx->embd_cache) {
+                cache_bytes += e.embd.size() * sizeof(float);
+            }
+            LOG_INF("%s: ViT embd cache hit (%zu/%zu images, hits=%zu misses=%zu, mem=%.2f MiB)\n",
+                    __func__, imgs.entries.size(), imgs.entries.size(),
+                    ctx->embd_cache_hits, ctx->embd_cache_misses,
+                    cache_bytes / 1024.0 / 1024.0);
+
+            // ABB-OPT (opt/vit-cache): mirror MTMD_DUMP_EMBD on cache hits so
+            // we can sanity-check that the cached payload matches a freshly
+            // computed one (debug only).
+            if (const char * dump_path = std::getenv("MTMD_DUMP_EMBD")) {
+                if (dump_path[0]) {
+                    char real_path[1024];
+                    snprintf(real_path, sizeof(real_path), "%s.%03d", dump_path, g_mtmd_dump_idx++);
+                    FILE * f = fopen(real_path, "wb");
+                    if (f) {
+                        // recover the per-image (nx, ny, n_tokens) from cache entries
+                        const auto & img = *imgs.entries[0];
+                        const auto & cache = ctx->embd_cache;
+                        auto it = std::find_if(cache.begin(), cache.end(),
+                            [&](const clip_ctx::embd_cache_entry & e) {
+                                return e.key == entry_keys[0] && e.nx == img.nx() && e.ny == img.ny();
+                            });
+                        const int n_embd_out = (int)(it->embd.size() / it->n_tokens);
+                        int32_t hdr[4] = {
+                            n_embd_out,
+                            (int32_t) it->n_tokens,
+                            (int32_t) imgs.entries.size(),
+                            1,
+                        };
+                        fwrite(hdr, sizeof(int32_t), 4, f);
+                        fwrite(out_batch_embd.data(), sizeof(float), out_batch_embd.size(), f);
+                        fclose(f);
+                        LOG_INF("%s: dumped cache-hit embeddings to %s\n", __func__, real_path);
+                    }
+                }
+            }
+            return true;
+        }
     }
 
     // build the inference graph
@@ -4453,6 +4607,35 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         LOG_WRN("%s: output buffer is empty, skipping copy\n", __func__);
     }
 
+    // ABB-OPT (opt/vit-cache): populate the cache for single-image requests.
+    // Multi-image batched outputs are split across the batch dim; we'd need
+    // per-slice slicing to cache them, which is out of scope for now -- the
+    // mtmd layer already routes qwen-vl multi-image through serial single
+    // image fallbacks, so each call here is effectively a single image.
+    if (ctx->embd_cache_enabled && !imgs.is_audio && imgs.entries.size() == 1
+            && !out_batch_embd.empty() && entry_keys.size() == 1) {
+        clip_ctx::embd_cache_entry e;
+        e.key      = entry_keys[0];
+        e.nx       = imgs.entries[0]->nx();
+        e.ny       = imgs.entries[0]->ny();
+        e.n_tokens = (size_t) embeddings->ne[1];
+        e.embd     = out_batch_embd; // copy
+
+        auto & cache = ctx->embd_cache;
+        cache.push_front(std::move(e));
+        while (cache.size() > ctx->embd_cache_capacity) {
+            cache.pop_back();
+        }
+        ctx->embd_cache_misses += 1;
+        size_t cache_bytes = 0;
+        for (const auto & ce : cache) {
+            cache_bytes += ce.embd.size() * sizeof(float);
+        }
+        LOG_INF("%s: ViT embd cache miss, inserted entry (size=%zu, hits=%zu misses=%zu, mem=%.2f MiB)\n",
+                __func__, cache.size(), ctx->embd_cache_hits, ctx->embd_cache_misses,
+                cache_bytes / 1024.0 / 1024.0);
+    }
+
     // Debug: dump final embeddings if MTMD_DEBUG_EMBEDDINGS is set
     if (ctx->debug_output_embeddings) {
         const int64_t n_embd = embeddings->ne[0];
@@ -4503,9 +4686,8 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
             // suffix the path with a counter so multiple encode calls in the
             // same run don't overwrite each other (baseline serial fallback
             // calls clip_image_batch_encode once per image)
-            static int dump_idx = 0;
             char real_path[1024];
-            snprintf(real_path, sizeof(real_path), "%s.%03d", dump_path, dump_idx++);
+            snprintf(real_path, sizeof(real_path), "%s.%03d", dump_path, g_mtmd_dump_idx++);
             FILE * f = fopen(real_path, "wb");
             if (f) {
                 int32_t hdr[4] = {
