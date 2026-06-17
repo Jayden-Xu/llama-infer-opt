@@ -4494,6 +4494,39 @@ bool clip_image_batch_encode(clip_ctx * ctx, const int n_threads, const clip_ima
         LOG_INF("=== END MTMD_DEBUG_EMBEDDINGS ===\n\n");
     }
 
+    // ABB-OPT: dump final embeddings to a binary file for offline numpy diff
+    // (used to compare baseline single-image vs vit-batch first-image slice).
+    // Layout: int32 ne0, int32 ne1, int32 ne2, int32 ne3, then float32 [ne0*ne1*ne2*ne3].
+    // Set MTMD_DUMP_EMBD=<path> to enable.
+    if (const char * dump_path = std::getenv("MTMD_DUMP_EMBD")) {
+        if (dump_path[0]) {
+            // suffix the path with a counter so multiple encode calls in the
+            // same run don't overwrite each other (baseline serial fallback
+            // calls clip_image_batch_encode once per image)
+            static int dump_idx = 0;
+            char real_path[1024];
+            snprintf(real_path, sizeof(real_path), "%s.%03d", dump_path, dump_idx++);
+            FILE * f = fopen(real_path, "wb");
+            if (f) {
+                int32_t hdr[4] = {
+                    (int32_t)embeddings->ne[0],
+                    (int32_t)embeddings->ne[1],
+                    (int32_t)embeddings->ne[2],
+                    (int32_t)embeddings->ne[3],
+                };
+                std::vector<float> buf(ggml_nelements(embeddings));
+                ggml_backend_tensor_get(embeddings, buf.data(), 0, ggml_nbytes(embeddings));
+                fwrite(hdr, sizeof(int32_t), 4, f);
+                fwrite(buf.data(), sizeof(float), buf.size(), f);
+                fclose(f);
+                LOG_INF("%s: dumped embeddings to %s (shape [%d, %d, %d, %d])\n",
+                        __func__, real_path, hdr[0], hdr[1], hdr[2], hdr[3]);
+            } else {
+                LOG_ERR("%s: failed to open %s for writing\n", __func__, real_path);
+            }
+        }
+    }
+
     return true;
 }
 

@@ -665,11 +665,14 @@ struct server_slot {
         // TODO @ngxson : move this log line to debug when it become more stable
         SLT_INF(*this, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
 
+        const int64_t t_vit_start = ggml_time_ms();
         res = mtmd_batch_encode(mbatch.get());
         if (res != 0) {
             SLT_ERR(*this, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
             return -1;
         }
+        SLT_INF(*this, "mtmd batch encoded in %" PRId64 " ms (n_chunks = %d)\n",
+                ggml_time_ms() - t_vit_start, n_added);
 
         return try_decode();
     }
