@@ -59,9 +59,12 @@
 set -euo pipefail
 
 # ----- cases: "<label> <env-var-list>" ----------------------------------
+# NOTE: OPT_FUSED_PRE_RMS is parked; it produces incorrect output because
+# ggml-alloc may alias the ADD node's buffer with other tensors. Re-enable
+# only after the ggml-sched / alloc work that lets a fused op produce two
+# distinct outputs lands.
 CASES=(
-    "baseline                "                                       # nothing enabled
-    "fused-pre-rms            OPT_FUSED_PRE_RMS=1"                   # fuse residual ADD + RMSNorm + MUL
+    "baseline                "                       # nothing enabled
 )
 
 # ----- config ----------------------------------------------------------

@@ -4237,15 +4237,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // ABB-OPT (opt/fused-pre-add-rmsnorm): fuse  ADD(residual) -> RMS_NORM -> MUL(gamma)
     // into a single rms_norm_f32 kernel. Eliminates the standalone k_bin_bcast<op_add>
-    // launch that materialises the residual sum. Default off; opt-in via env.
+    // launch that materialises the residual sum.
     //
-    // Detection notes:
-    //  - The leading ADD's output is also consumed by the *next* block's residual,
-    //    so it has external uses. We therefore use ggml_can_fuse_subgraph with an
-    //    explicit `outputs` list naming both the ADD and the MUL nodes (the kernel
-    //    persists both: ADD's residual sum -> add_node->data, MUL's scaled output
-    //    -> mul_node->data). ggml_cuda_can_fuse() would reject this pattern because
-    //    its underlying ggml_can_fuse() requires single in-subgraph use.
+    // STATUS: parked. Skipping the ADD node (return 2) means add_node->data is
+    // never written by ggml's normal evaluator, but downstream blocks still
+    // consume `ffn_inp` from that buffer. ggml-alloc may also alias add_node's
+    // buffer to other tensors during the same graph, so writing the residual
+    // sum back from inside the fused kernel corrupts unrelated data
+    // (observed: image embeddings get clobbered, the model returns
+    // "I'm unable to see any image"). Until we wire a proper
+    // "this fused op produces both add_node and mul_node outputs"
+    // interface into ggml-sched / alloc, this fusion is unsafe -- keep
+    // OPT_FUSED_PRE_RMS opt-in, default OFF, so baseline behaviour is
+    // bit-for-bit equal to upstream.
     static const bool opt_fused_pre_rms = []{
         const char * e = getenv("OPT_FUSED_PRE_RMS");
         return e != nullptr && std::atoi(e) > 0;
@@ -4259,7 +4263,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         ggml_tensor * rms_norm_node = cgraph->nodes[i + 1];
         ggml_tensor * mul_node      = cgraph->nodes[i + 2];
 
-        // pattern guards — keep the kernel's bookkeeping correct:
         const bool types_ok =
             add_node->src[0]->type == GGML_TYPE_F32 &&
             add_node->src[1]->type == GGML_TYPE_F32 &&
@@ -4270,12 +4273,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const bool topology_ok =
             rms_norm_node->src[0] == add_node &&
             (mul_node->src[0] == rms_norm_node || mul_node->src[1] == rms_norm_node);
-        // Both src[0] / src[1] / add_node itself / mul_node must be fully contiguous
-        // because the fused kernel writes back to add_node->data using the *same*
-        // packed offset it uses for x. If any of these have non-trivial nb strides
-        // (views, get_rows results) or src[1] is broadcast (e.g. bias add) the
-        // layout assumption breaks and we corrupt downstream KV / image embeddings,
-        // so bail out conservatively to the unfused 3-kernel path.
         const bool layout_ok =
             ggml_is_contiguous(add_node->src[0]) &&
             ggml_is_contiguous(add_node->src[1]) &&
