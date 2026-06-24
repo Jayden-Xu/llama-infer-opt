@@ -60,7 +60,8 @@ set -euo pipefail
 
 # ----- cases: "<label> <env-var-list>" ----------------------------------
 CASES=(
-    "baseline                "                       # nothing enabled
+    "baseline                "                                       # nothing enabled
+    "fused-pre-rms            OPT_FUSED_PRE_RMS=1"                   # fuse residual ADD + RMSNorm + MUL
 )
 
 # ----- config ----------------------------------------------------------
