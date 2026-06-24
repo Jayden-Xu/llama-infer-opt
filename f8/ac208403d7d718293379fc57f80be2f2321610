@@ -1,0 +1,21 @@
+scripts/check-fused-pre-rms.sh
+  s_d80074e5a62931::t_95a996c5db01c3 1-109
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "f8ac208403d7d718293379fc57f80be2f2321610",
+  "prompts": {},
+  "sessions": {
+    "s_d80074e5a62931": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3133e697cf26eeca8efd51",
+        "model": "openrouter-2o__max"
+      },
+      "human_author": "xupeiyu <xupeiyu@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
