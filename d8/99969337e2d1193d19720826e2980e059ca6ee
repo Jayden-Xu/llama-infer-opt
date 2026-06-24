@@ -1,0 +1,36 @@
+ggml/src/ggml-cuda/ggml-cuda.cu
+  s_d80074e5a62931::t_93b4004cae1b12 4238-4272
+ggml/src/ggml-cuda/norm.cuh
+  s_d80074e5a62931::t_f49dd0c9f7674a 16-21
+ggml/src/ggml-cuda/norm.cu
+  s_d80074e5a62931::t_cf0994c36d2304 76-81,85,120-121,139,150-154,166-173,179
+  s_d80074e5a62931::t_8190dfde40487d 82-84,108-109
+  s_d80074e5a62931::t_5a0df4a9c5b2d7 125-130
+  s_d80074e5a62931::t_8a52cf69008e0c 174-178
+  s_d80074e5a62931::t_af0cadde9a53fc 350-351,358-359
+  s_d80074e5a62931::t_f6bc8a603b6be7 407-408,416-417
+  s_d80074e5a62931::t_279a3a1a14ceb8 436-437,445-446
+  s_d80074e5a62931::t_59cf4cf60c72d9 455-459,461-505,508-517,520-522
+  s_d80074e5a62931::t_a234aedc4b3e09 460,506-507,518-519
+  s_d80074e5a62931::t_f3727824ccdad6 753-784,788-822,824-832
+  s_d80074e5a62931::t_e9e4252955718c 785-787
+  s_d80074e5a62931::t_16d0962d8692ec 823
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "d899969337e2d1193d19720826e2980e059ca6ee",
+  "prompts": {},
+  "sessions": {
+    "s_d80074e5a62931": {
+      "agent_id": {
+        "tool": "trae",
+        "id": "6a3133e697cf26eeca8efd51",
+        "model": "openrouter-2o__max"
+      },
+      "human_author": "xupeiyu <xupeiyu@bytedance.com>"
+    }
+  },
+  "attestation_metadata": {},
+  "remote_transcripts": {}
+}
